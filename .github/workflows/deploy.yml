@@ -1,0 +1,81 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main  # Change if your branch name is different
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e  # Exit on any error
+            
+            echo "=== Starting deployment ==="
+            
+            # Navigate to project directory
+            cd /home/ubuntu/seekhidden-parsing
+            echo "Current directory: $(pwd)"
+            
+            # Pull latest changes
+            echo "=== Pulling latest changes ==="
+            git pull origin main
+            
+            # Set up Node.js environment
+            echo "=== Setting up Node.js environment ==="
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+            
+            # If NVM setup fails, try direct paths
+            if ! command -v node &> /dev/null; then
+              echo "Node.js not found via NVM, trying direct paths..."
+              # Common Node.js installation paths
+              for node_path in "/usr/local/bin" "/opt/nodejs/bin" "$HOME/.nvm/versions/node/v*/bin" "/usr/bin"; do
+                if [ -f "$node_path/node" ]; then
+                  export PATH="$node_path:$PATH"
+                  echo "Found Node.js at: $node_path"
+                  break
+                fi
+              done
+            fi
+            
+            # Verify Node.js and npm are available
+            echo "=== Verifying Node.js installation ==="
+            echo "Node.js path: $(which node)"
+            echo "NPM path: $(which npm)"
+            echo "Node.js version: $(node --version)"
+            echo "NPM version: $(npm --version)"
+            
+            # Install dependencies
+            echo "=== Installing dependencies ==="
+            npm install
+            
+            # Install PM2 globally if not present
+            if ! command -v pm2 &> /dev/null; then
+              echo "=== Installing PM2 globally ==="
+              npm install -g pm2
+            fi
+            
+            echo "PM2 path: $(which pm2)"
+            
+            # Restart or start the application
+            echo "=== Starting/Restarting application ==="
+            pm2 restart cparser || pm2 start src/server.js --name cparser
+            
+            # Show PM2 status
+            echo "=== PM2 Status ==="
+            pm2 list
+            
+            echo "=== Deployment completed successfully ==="
