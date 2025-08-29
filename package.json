@@ -1,0 +1,37 @@
+{
+  "name": "job-distribution-system",
+  "version": "1.0.0",
+  "description": "Backend for Job Distribution & Tracking System",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "build:cpp": "node-gyp configure && node-gyp build",
+    "clean:build": "rimraf build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tryidoltech/seekhidden-parsing.git"
+  },
+  "author": "Tryidol Tech",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/tryidoltech/seekhidden-parsing.git/issues"
+  },
+  "homepage": "https://github.com/tryidoltech/seekhidden-parsing.git#readme",
+  "dependencies": {
+    "dotenv": "^17.1.0",
+    "express": "^5.1.0",
+    "mongoose": "^8.18.0",
+    "node-addon-api": "^8.5.0",
+    "node-cron": "^4.2.0",
+    "node-fetch": "^3.3.2",
+    "sax": "^1.4.1",
+    "xml-flow": "^1.0.4"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.3.0",
+    "nodemon": "^3.1.10"
+  }
+}

@@ -1,0 +1,33 @@
+# Node modules
+node_modules/
+
+# dotenv environment files
+.env
+.env.local
+.env.*.local
+
+# Log files
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# VS Code settings
+.vscode/
+
+# Build or temp folders
+dist/
+tmp/
+temp/
+build/
+
+# Runtime generated files
+*.gz
+*.zip
+
+*.bat
