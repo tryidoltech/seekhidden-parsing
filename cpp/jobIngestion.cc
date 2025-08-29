@@ -263,12 +263,174 @@ static size_t DownloadToStringCallback(void* contents, size_t size, size_t nmemb
     return size * nmemb;
 }
 
+// --- Asynchronous Worker for Job Ingestion ---
+class JobIngestionWorker : public Napi::AsyncWorker {
+public:
+    JobIngestionWorker(Napi::Env env,
+                       const std::string& url,
+                       const std::string& mongo_uri,
+                       const Napi::Array& mapping_array,
+                       const std::string& client_id)
+        : Napi::AsyncWorker(env),
+          _url(url),
+          _mongo_uri_str(mongo_uri),
+          _clientId(client_id),
+          _deferred(Napi::Promise::Deferred::New(env)) {
+        
+        // Copy mapping now, as Napi types are not safe on the worker thread
+        for (uint32_t i = 0; i < mapping_array.Length(); i++) {
+            Napi::Object mapping_obj = mapping_array.Get(i).As<Napi::Object>();
+            _node_mapping[mapping_obj.Get("client_node").As<Napi::String>()] = 
+                mapping_obj.Get("internal_field").As<Napi::String>();
+        }
+    }
+
+    ~JobIngestionWorker() {}
+
+    Napi::Promise GetPromise() { return _deferred.Promise(); }
+
+protected:
+    void Execute() override {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // --- 1. Download Data ---
+        std::string downloaded_data;
+        CURL* curl_handle;
+        CURLcode res;
+        char errbuff[CURL_ERROR_SIZE] = {0};
+
+        curl_handle = curl_easy_init();
+        if (!curl_handle) {
+            SetError("cURL init failed");
+            return;
+        }
+
+        curl_easy_setopt(curl_handle, CURLOPT_URL, _url.c_str());
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, DownloadToStringCallback);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &downloaded_data);
+        curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "xml-ingestion-addon/1.0");
+        curl_easy_setopt(curl_handle, CURLOPT_FAILONERROR, 1L);
+        curl_easy_setopt(curl_handle, CURLOPT_ERRORBUFFER, errbuff);
+
+        res = curl_easy_perform(curl_handle);
+        curl_easy_cleanup(curl_handle);
+
+        if (res != CURLE_OK) {
+            SetError("cURL failed: " + std::string(curl_easy_strerror(res)) + " - " + std::string(errbuff));
+            return;
+        }
+
+        // --- 2. Decompress if Necessary ---
+        std::string xmlContent;
+        bool is_gzipped = _url.size() > 3 && _url.substr(_url.size() - 3) == ".gz";
+
+        if (is_gzipped) {
+            try {
+                xmlContent = GzipDecompress(downloaded_data);
+            } catch (const std::runtime_error& e) {
+                SetError(e.what());
+                return;
+            }
+        } else {
+            xmlContent = downloaded_data;
+        }
+
+        // --- 3. Parse XML and Ingest to DB ---
+        const int NUM_THREADS = 4;
+        std::atomic<long> atomicInsertedCount(0);
+        std::atomic<long> atomicFailedCount(0);
+
+        try {
+            mongocxx::uri uri(_mongo_uri_str);
+            mongocxx::pool pool(uri);
+
+            JobQueue queue;
+            std::vector<std::thread> workers;
+
+            ParserContext parser_context;
+            parser_context.queue = &queue;
+            parser_context.node_mapping = &_node_mapping;
+            parser_context.clientId = _clientId;
+
+            XML_Parser parser = XML_ParserCreate(NULL);
+            XML_SetUserData(parser, &parser_context);
+            XML_SetElementHandler(parser, startElement, endElement);
+            XML_SetCharacterDataHandler(parser, characterData);
+
+            for (int i = 0; i < NUM_THREADS; ++i) {
+                workers.emplace_back(mongoWorker, &pool, &queue, &atomicInsertedCount, &atomicFailedCount);
+            }
+
+            if (XML_Parse(parser, xmlContent.c_str(), xmlContent.length(), 1) == XML_STATUS_ERROR) {
+                char error_string[1024];
+                sprintf(error_string, "XML_Parse error at line %lu: %s",
+                        XML_GetCurrentLineNumber(parser),
+                        XML_ErrorString(XML_GetErrorCode(parser)));
+                XML_ParserFree(parser);
+                queue.done();
+                for (auto& worker : workers) {
+                    if (worker.joinable()) worker.join();
+                }
+                SetError(error_string);
+                return;
+            }
+
+            XML_ParserFree(parser);
+            queue.done();
+            for (auto& worker : workers) {
+                if (worker.joinable()) worker.join();
+            }
+
+            _insertedCount = atomicInsertedCount.load();
+            _failedCount = atomicFailedCount.load();
+
+        } catch (const std::exception& e) {
+            SetError("Database or parsing setup error: " + std::string(e.what()));
+            return;
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        _duration_s = std::chrono::duration<double>(t1 - t0).count();
+    }
+
+    void OnOK() override {
+        Napi::Env env = Env();
+        Napi::HandleScope scope(env);
+
+        Napi::Object result = Napi::Object::New(env);
+        result.Set("totalProcessed", Napi::Number::New(env, _insertedCount + _failedCount));
+        result.Set("inserted", Napi::Number::New(env, _insertedCount));
+        result.Set("failed", Napi::Number::New(env, _failedCount));
+        result.Set("duration_s", Napi::Number::New(env, _duration_s));
+
+        _deferred.Resolve(result);
+    }
+
+    void OnError(const Napi::Error& e) override {
+        Napi::Env env = Env();
+        Napi::HandleScope scope(env);
+        _deferred.Reject(e.Value());
+    }
+
+private:
+    std::string _url;
+    std::string _mongo_uri_str;
+    std::string _clientId;
+    std::unordered_map<std::string, std::string> _node_mapping;
+    
+    long _insertedCount = 0;
+    long _failedCount = 0;
+    double _duration_s = 0.0;
+
+    Napi::Promise::Deferred _deferred;
+};
+
 // --- N-API Addon ---
 mongocxx::instance instance{};
 
 Napi::Value ingestJobsFromUrl(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    auto t0 = std::chrono::high_resolution_clock::now();
 
     if (info.Length() < 4 || !info[0].IsString() || !info[1].IsString() || !info[2].IsArray() || !info[3].IsString()) {
         Napi::TypeError::New(env, "Expected (String feed_url, String mongo_uri, Array node_mapping, String clientId)").ThrowAsJavaScriptException();
@@ -280,123 +442,9 @@ Napi::Value ingestJobsFromUrl(const Napi::CallbackInfo& info) {
     Napi::Array mapping_array = info[2].As<Napi::Array>();
     std::string clientId = info[3].As<Napi::String>().Utf8Value();
 
-    std::unordered_map<std::string, std::string> node_mapping;
-    for (uint32_t i = 0; i < mapping_array.Length(); i++) {
-        Napi::Object mapping_obj = mapping_array.Get(i).As<Napi::Object>();
-        node_mapping[mapping_obj.Get("client_node").As<Napi::String>()] = mapping_obj.Get("internal_field").As<Napi::String>();
-    }
-
-    // --- 1. Download Data ---
-    CURL* curl_handle;
-    CURLcode res;
-    std::string downloaded_data;
-    char errbuff[CURL_ERROR_SIZE] = {0};
-
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    curl_handle = curl_easy_init();
-    if (!curl_handle) {
-        curl_global_cleanup();
-        Napi::Error::New(env, "cURL init failed").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, DownloadToStringCallback);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &downloaded_data);
-    curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "xml-ingestion-addon/1.0");
-    curl_easy_setopt(curl_handle, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl_handle, CURLOPT_ERRORBUFFER, errbuff);
-
-    res = curl_easy_perform(curl_handle);
-    curl_easy_cleanup(curl_handle);
-
-    if (res != CURLE_OK) {
-        std::string error_msg = "cURL failed: " + std::string(curl_easy_strerror(res)) + " - " + std::string(errbuff);
-        Napi::Error::New(env, error_msg).ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    // --- 2. Decompress if Necessary ---
-    std::string xmlContent;
-    bool is_gzipped = url.size() > 3 && url.substr(url.size() - 3) == ".gz";
-
-    if (is_gzipped) {
-        try {
-            xmlContent = GzipDecompress(downloaded_data);
-        } catch (const std::runtime_error& e) {
-            Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-            return env.Null();
-        }
-    } else {
-        xmlContent = downloaded_data;
-    }
-
-    // --- 3. Parse XML and Ingest to DB ---
-    const int NUM_THREADS = 4;
-    long total_processed = 0;
-    std::atomic<long> insertedCount(0);
-    std::atomic<long> failedCount(0);
-
-    try {
-        mongocxx::uri uri(mongo_uri_str);
-        mongocxx::pool pool(uri);
-
-        JobQueue queue;
-        std::vector<std::thread> workers;
-
-        ParserContext parser_context;
-        parser_context.queue = &queue;
-        parser_context.node_mapping = &node_mapping;
-        parser_context.clientId = clientId;
-
-        XML_Parser parser = XML_ParserCreate(NULL);
-        XML_SetUserData(parser, &parser_context);
-        XML_SetElementHandler(parser, startElement, endElement);
-        XML_SetCharacterDataHandler(parser, characterData);
-
-        for (int i = 0; i < NUM_THREADS; ++i) {
-            workers.emplace_back(mongoWorker, &pool, &queue, &insertedCount, &failedCount);
-        }
-
-        if (XML_Parse(parser, xmlContent.c_str(), xmlContent.length(), 1) == XML_STATUS_ERROR) {
-            char error_string[1024];
-            sprintf(error_string, "XML_Parse error at line %lu: %s",
-                    XML_GetCurrentLineNumber(parser),
-                    XML_ErrorString(XML_GetErrorCode(parser)));
-            XML_ParserFree(parser);
-            // Ensure threads are cleaned up even on error
-            queue.done();
-            for (auto& worker : workers) {
-                if (worker.joinable()) worker.join();
-            }
-            Napi::Error::New(env, error_string).ThrowAsJavaScriptException();
-            return env.Null();
-        }
-
-        XML_ParserFree(parser);
-        queue.done();
-        for (auto& worker : workers) {
-            if (worker.joinable()) worker.join();
-        }
-
-    } catch (const std::exception& e) {
-        Napi::Error::New(env, "Database or parsing setup error: " + std::string(e.what())).ThrowAsJavaScriptException();
-        return env.Null();
-    }
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double secs = std::chrono::duration<double>(t1 - t0).count();
-
-    total_processed = insertedCount + failedCount;
-
-    Napi::Object result = Napi::Object::New(env);
-    result.Set("totalProcessed", Napi::Number::New(env, total_processed));
-    result.Set("inserted", Napi::Number::New(env, (long)insertedCount));
-    result.Set("failed", Napi::Number::New(env, (long)failedCount));
-    result.Set("duration_s", Napi::Number::New(env, secs));
-
-    return result;
+    JobIngestionWorker* worker = new JobIngestionWorker(env, url, mongo_uri_str, mapping_array, clientId);
+    worker->Queue();
+    return worker->GetPromise();
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {

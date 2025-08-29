@@ -1,140 +1,91 @@
-// src/services/feedCron.js
 import Client from "../models/client.model.js";
-import axios from "axios";
-import zlib from "zlib";
-import xmlFlow from "xml-flow";
-import Job from "../models/job.model.js";
-import path from "path";
-import { fileURLToPath } from "url";
+// The C++ addon is the key to non-blocking, high-performance ingestion.
+import { createRequire } from 'module';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Native addons (.node files) can't be loaded with 'import'. We need to use
+// createRequire to get a CommonJS-style require function that can handle them.
+const require = createRequire(import.meta.url);
+const { ingestJobsFromUrl } = require('../../build/Release/jobIngestion.node');
 
-
-async function processFeed(feedUrl, clientId, client = null) {
-  const start = Date.now();
-
-
-  console.log(`[FeedCron] 📝 JavaScript ingestion start for client ${clientId} -> ${feedUrl}`);
-  // Determine mapping for this feed: prioritize per-feed mapping, fallback to legacy client.feed_node_mapping
-  let mapping = [];
-  if (Array.isArray(client.feeds)) {
-    const feedConfig = client.feeds.find(f => f.feed_source_url === feedUrl);
-    if (feedConfig?.feed_node_mapping?.length) {
-      mapping = feedConfig.feed_node_mapping;
-    }
-  }
-  // If no per-feed mapping, use legacy top-level feed_node_mapping
-  if (mapping.length === 0 && Array.isArray(client.feed_node_mapping)) {
-    mapping = client.feed_node_mapping;
-  }
-  await processFeedFallback(feedUrl, clientId, mapping);
-  console.log(`[FeedCron] ✅ JavaScript ingestion finished for client ${clientId} in ${Date.now() - start}ms`);
-}
-
-async function processFeedFallback(feedUrl, clientId, mapping = []) {
-  const response = await axios({
-    method: "get",
-    url: feedUrl,
-    responseType: "stream",
-    timeout: 600000,
-  });
-
-  const gunzip = zlib.createGunzip();
-  const xmlStream = xmlFlow(response.data.pipe(gunzip));
-  let jobCount = 0;
-
-  return new Promise((resolve, reject) => {
-    // Prepare batch operations
-    let ops = [];
-    const batchSize = 1000;
-    // Helper to flush batch
-    async function flushOps() {
-      if (ops.length === 0) return;
-      try {
-        await Job.bulkWrite(ops, { ordered: false });
-        console.log(`[FeedCron][JS] Flushed ${ops.length} jobs for client ${clientId}`);
-      } catch (e) {
-        console.error(`[FeedCron][JS] Bulk write error for client ${clientId}:`, e.message);
-      } finally {
-        ops = [];
-      }
-    }
-    xmlStream.on("tag:job", (jobData) => {
-      (async () => {
-        try {
-          const sanitizedData = Object.entries(jobData)
-            .filter(([key]) => !key.startsWith('$'))
-            .reduce((acc, [key, value]) => ({ ...acc, [key]: value }), {});
-          const jobId =
-             jobData.job_id || jobData.id || jobData.jobId || jobData.jobid ||
-             jobData.external_id || jobData.externalId || jobData.url || jobData.apply_url;
-          if (jobId) {
-            const mappedFields = mapping.reduce((acc, { client_node, internal_field }) => {
-              if (sanitizedData[client_node] !== undefined) {
-                acc[internal_field] = sanitizedData[client_node];
-              }
-              return acc;
-            }, { job_id: String(jobId) });
-            ops.push({
-              updateOne: {
-                filter: { feed_id: clientId, "mapped_fields.job_id": String(jobId) },
-                update: { $set: { feed_id: clientId, mapped_fields: mappedFields } },
-                upsert: true,
-              }
-            });
-            jobCount++;
-            if (jobCount % batchSize === 0) {
-              await flushOps();
-            }
-          }
-        } catch (err) {
-          console.error(`[FeedCron][JS] Error preparing job for client ${clientId}:`, err.message);
-        } finally {
-          // no pause/resume to prevent skipping
-        }
-      })();
-    });
-
-  xmlStream.on("end", () => {
-      (async () => {
-        await flushOps();
-        console.log(`[FeedCron][JS] Completed. Total processed: ${jobCount} for client ${clientId}`);
-        resolve();
-      })();
-    });
-
-    xmlStream.on("error", (err) => reject(err));
-  });
-}
-
+/**
+ * This function orchestrates the entire feed ingestion process.
+ * It finds active clients, iterates through their feeds (both new and legacy formats),
+ * and calls the C++ addon to download, parse, and ingest the jobs for each feed in parallel.
+ * This non-blocking approach prevents the "missed execution" warning from node-cron.
+ */
 export async function runCronCycle() {
-  console.log("[FeedCron] Starting scheduled feed processing...");
-  // Use cursor to stream clients one by one
-  const query = {
-    $or: [
-      { feed_source_url: { $exists: true, $ne: "" } },
-      { "feeds.0.feed_source_url": { $exists: true, $ne: "" } },
-    ],
-  };
-  const clientCursor = Client.find(query).cursor();
-  let count = 0;
+  console.log("[Cron] Starting feed ingestion cycle...");
   try {
-    for await (const client of clientCursor) {
-      count++;
-      // Process each feed for this client
-      if (Array.isArray(client.feeds) && client.feeds.length) {
+    // 1. Find all active clients that have at least one feed defined (new or legacy).
+    const clients = await Client.find({
+      status: "active",
+      $or: [
+        { "feeds.0": { $exists: true } },
+        { feed_source_url: { $exists: true, $ne: null, $ne: "" } },
+      ],
+    }).lean();
+
+    if (clients.length === 0) {
+      console.log("[Cron] No active clients with feeds to process.");
+      return;
+    }
+
+    console.log(`[Cron] Found ${clients.length} active client(s) to process.`);
+
+    const ingestionPromises = [];
+
+    const queueIngestion = (client, feedUrl, nodeMapping) => {
+      if (!feedUrl || !nodeMapping || nodeMapping.length === 0) {
+        return;
+      }
+      console.log(
+        `[Cron] Queueing C++ ingestion for client: ${client.internal_name}, feed: ${feedUrl}`
+      );
+
+      // Call the C++ addon. It's asynchronous and runs in its own threads,
+      // so it will not block the Node.js event loop.
+      const promise = ingestJobsFromUrl(
+        feedUrl,
+        process.env.MONGO_URI,
+        nodeMapping,
+        client._id.toString()
+      )
+        .then((result) => {
+          console.log(`[Cron] C++ Ingestion result for ${feedUrl}:`, result);
+          // TODO: Update feed status in DB
+        })
+        .catch((err) => {
+          console.error(`[Cron] C++ Ingestion failed for ${feedUrl}:`, err);
+          // TODO: Update feed status in DB
+        });
+
+      ingestionPromises.push(promise);
+    };
+
+    // 2. Iterate over each client and their feeds.
+    for (const client of clients) {
+      // Prefer the new `feeds` array structure
+      if (Array.isArray(client.feeds) && client.feeds.length > 0) {
         for (const feed of client.feeds) {
-          if (feed.feed_source_url?.trim()) {
-            await processFeed(feed.feed_source_url, client._id, client);
+          if (feed.is_active) {
+            queueIngestion(client, feed.feed_source_url, feed.feed_node_mapping);
           }
         }
-      } else if (client.feed_source_url?.trim()) {
-        await processFeed(client.feed_source_url, client._id, client);
+      }
+      // Fallback to the legacy top-level feed fields
+      else {
+        queueIngestion(client, client.feed_source_url, client.feed_node_mapping);
       }
     }
-    console.log(`[FeedCron] Completed processing ${count} clients.`);
-  } catch (err) {
-    console.error("[FeedCron] Error in scheduled job:", err.message);
+
+    // 3. Wait for all parallel ingestion tasks to complete.
+    if (ingestionPromises.length > 0) {
+      console.log(`[Cron] Waiting for ${ingestionPromises.length} ingestion tasks to complete...`);
+      await Promise.all(ingestionPromises);
+    }
+
+    console.log("[Cron] Feed ingestion cycle completed.");
+  } catch (error) {
+    console.error("[Cron] A critical error occurred during the cron cycle:", error);
   }
 }

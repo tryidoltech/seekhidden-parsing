@@ -21,6 +21,7 @@
   },
   "homepage": "https://github.com/tryidoltech/seekhidden-parsing.git#readme",
   "dependencies": {
+    "axios": "^1.11.0",
     "dotenv": "^17.1.0",
     "express": "^5.1.0",
     "mongoose": "^8.18.0",

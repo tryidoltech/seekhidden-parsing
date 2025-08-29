@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 6000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
   cron.schedule(
-    '*/5 * * * *',
+    '*/2 * * * *',
     async () => {
       console.log('[Cron] Running feed ingestion cycle...');
       await runCronCycle();
